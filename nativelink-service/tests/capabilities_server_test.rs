@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use futures::join;
 use nativelink_config::cas_server::{
-    CapabilitiesConfig, CapabilitiesRemoteExecutionConfig, WithInstanceName,
+    AcStoreConfig, CapabilitiesConfig, CapabilitiesRemoteExecutionConfig, WithInstanceName,
 };
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::execution::v2::capabilities_server::Capabilities;
@@ -74,6 +74,7 @@ async fn compression_only_instance_advertises_zstd_cache_capabilities()
         &HashMap::new(),
         &remote_cache_compression_instances,
         &[],
+        &[],
     )
     .await?;
 
@@ -112,6 +113,7 @@ async fn compression_only_instance_does_not_advertise_execution_capabilities()
         &HashMap::new(),
         &remote_cache_compression_instances,
         &[],
+        &[],
     )
     .await?;
 
@@ -140,6 +142,7 @@ async fn remote_execution_instance_advertises_execution_capabilities_and_node_pr
         &configs,
         &scheduler_map,
         &remote_cache_compression_instances,
+        &[],
         &[],
     );
     let expected_scheduler_call_fut =
@@ -171,5 +174,58 @@ async fn remote_execution_instance_advertises_execution_capabilities_and_node_pr
         execution_capabilities.supported_node_properties,
         expected_properties
     );
+    Ok(())
+}
+
+// REv2 `ActionCacheUpdateCapabilities.update_enabled` tells the client
+// whether `UpdateActionResult` will be accepted. A `read_only` Action Cache
+// refuses it, so the instance must not advertise updates. An instance with
+// no Action Cache in this config keeps advertising them, since another
+// process may serve it.
+#[nativelink_test]
+async fn read_only_action_cache_disables_update_enabled() -> Result<(), Box<dyn core::error::Error>>
+{
+    let ac_config = |instance_name: &str, read_only: bool| WithInstanceName {
+        instance_name: instance_name.to_string(),
+        config: AcStoreConfig {
+            ac_store: "AC_STORE".to_string(),
+            read_only,
+        },
+    };
+    let configs = [
+        capabilities_config("read_only", false, false),
+        capabilities_config("writable", false, false),
+        capabilities_config("mixed", false, false),
+        capabilities_config("no_ac", false, false),
+    ];
+    let server = CapabilitiesServer::new(
+        &configs,
+        &HashMap::new(),
+        &RemoteCacheCompressionInstances::from_capabilities_configs(&configs),
+        &[],
+        &[
+            ac_config("read_only", true),
+            ac_config("writable", false),
+            ac_config("mixed", true),
+            ac_config("mixed", false),
+        ],
+    )
+    .await?;
+
+    for (instance_name, expected) in [
+        ("read_only", false),
+        ("writable", true),
+        ("mixed", true),
+        ("no_ac", true),
+    ] {
+        let update_enabled = get_capabilities(&server, instance_name)
+            .await?
+            .cache_capabilities
+            .expect("cache capabilities should be set")
+            .action_cache_update_capabilities
+            .expect("action cache update capabilities should be set")
+            .update_enabled;
+        assert_eq!(update_enabled, expected, "instance {instance_name}");
+    }
     Ok(())
 }
