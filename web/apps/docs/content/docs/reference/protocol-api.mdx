@@ -150,6 +150,10 @@ retries returns `ActionStage::Completed` with `ActionResult.error` set: a
 successful RPC describing a failed action. This is what the REAPI specifies.
 Clients that only inspect the gRPC status will misread it.
 
+**Parents of outputs exist before the action runs.** The worker creates the
+directories leading up to every entry of `output_paths`, and of the legacy
+`output_files` and `output_directories`, but not the output paths themselves.
+
 **`Action.do_not_cache` skips the cache lookup and in-flight merging.** Such
 an action is never answered from the Action Cache and never shares an
 execution with an identical action that is already running. The worker still
