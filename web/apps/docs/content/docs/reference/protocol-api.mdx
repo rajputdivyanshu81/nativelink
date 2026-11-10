@@ -159,6 +159,19 @@ writes its result to the Action Cache; that part is tracked in
 **`server_logs` is never populated.** The field exists; the worker does not
 fill it.
 
+**`Execute` honours the inline hints within a 1 MiB budget.** When an
+`ExecuteRequest` sets `inline_stdout`, `inline_stderr` or
+`inline_output_files`, the final `ExecuteResponse` carries the requested
+stdout, stderr and output file contents, read from the instance's CAS. An
+output file is inlined only when its path matches a listed path exactly. The
+inlined bytes of one response total at most 1 MiB, well under the 4 MiB
+default message limit: a blob that would exceed what is left of that budget,
+an empty blob and a blob that cannot be read are left out, and the digests
+stay set either way, so the client fetches those from the CAS. `WaitExecution`
+carries no hints and inlines nothing. The same fields on
+`GetActionResultRequest` are not yet honoured. See
+<SourceLink file="nativelink-service/src/execution_server.rs" symbol="inline_execute_outputs" />.
+
 **Bad arguments return `INVALID_ARGUMENT`.** An unknown `instance_name`, or a
 request missing a digest it requires, is a client error, so every service
 answers `INVALID_ARGUMENT` rather than `INTERNAL`. Clients such as Bazel retry

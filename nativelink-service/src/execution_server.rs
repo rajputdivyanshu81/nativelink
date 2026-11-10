@@ -15,12 +15,13 @@
 use core::convert::Into;
 use core::pin::Pin;
 use core::time::Duration;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use futures::future::Either;
 use futures::stream::unfold;
 use futures::{Stream, StreamExt};
 use nativelink_config::cas_server::{ExecutionConfig, InstanceName, WithInstanceName};
@@ -29,8 +30,10 @@ use nativelink_proto::build::bazel::remote::execution::v2::execution_server::{
     Execution, ExecutionServer as Server,
 };
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    Action, Command, ExecuteRequest, WaitExecutionRequest,
+    Action, ActionResult as ProtoActionResult, Command, Digest, ExecuteRequest, ExecuteResponse,
+    WaitExecutionRequest,
 };
+use nativelink_proto::google::longrunning::operation::Result as LongRunningResult;
 use nativelink_proto::google::longrunning::operations_server::{Operations, OperationsServer};
 use nativelink_proto::google::longrunning::{
     CancelOperationRequest, DeleteOperationRequest, GetOperationRequest, ListOperationsRequest,
@@ -90,6 +93,133 @@ async fn forget_missing_input(cas_store: &Store, stage: &ActionStage) {
         cache.remove_from_cache(&digest).await;
         debug!(%digest, "Action input missing; dropped it from the existence cache");
     }
+}
+
+/// The most bytes `Execute` inlines into one final `ExecuteResponse`, summed
+/// over stdout, stderr and output files. REAPI requires the server to skip
+/// inlining that would make the response exceed message size limits; 1 MiB
+/// leaves ample room for the rest of the response under the 4 MiB default
+/// gRPC message limit, so a blob that would push past it is left to the
+/// client to fetch by digest.
+const MAX_EXECUTE_INLINE_BYTES: u64 = 1024 * 1024;
+
+/// The inlining hints of an `ExecuteRequest` (REAPI v2.9).
+#[derive(Debug)]
+struct InlineHints {
+    stdout: bool,
+    stderr: bool,
+    output_files: HashSet<String>,
+}
+
+impl InlineHints {
+    /// Returns `None` when the request asks for no inlining.
+    fn from_request(stdout: bool, stderr: bool, output_files: Vec<String>) -> Option<Self> {
+        if !stdout && !stderr && output_files.is_empty() {
+            return None;
+        }
+        Some(Self {
+            stdout,
+            stderr,
+            output_files: output_files.into_iter().collect(),
+        })
+    }
+}
+
+/// Reads one blob for inlining, or `None` when it is absent, empty, larger
+/// than the remaining budget, or cannot be read. A hint never fails the
+/// request, so a failed read is only logged.
+async fn fetch_inline_blob(
+    cas_store: &Store,
+    digest: Option<&Digest>,
+    budget: &mut u64,
+) -> Option<Bytes> {
+    let digest = DigestInfo::try_from(digest?).ok()?;
+    let size = digest.size_bytes();
+    if size == 0 || size > *budget {
+        return None;
+    }
+    match cas_store.get_part_unchunked(digest, 0, Some(size)).await {
+        Ok(data) => {
+            *budget -= size;
+            Some(data)
+        }
+        Err(err) => {
+            warn!(%digest, ?err, "Execute: could not read a blob to inline; leaving it out");
+            None
+        }
+    }
+}
+
+/// Inlines the requested stdout, stderr and output files into `result`
+/// within [`MAX_EXECUTE_INLINE_BYTES`]. Returns whether anything changed.
+async fn inline_action_result(
+    result: &mut ProtoActionResult,
+    hints: &InlineHints,
+    cas_store: &Store,
+) -> bool {
+    let mut budget = MAX_EXECUTE_INLINE_BYTES;
+    let mut changed = false;
+    if hints.stdout
+        && let Some(data) =
+            fetch_inline_blob(cas_store, result.stdout_digest.as_ref(), &mut budget).await
+    {
+        result.stdout_raw = data;
+        changed = true;
+    }
+    if hints.stderr
+        && let Some(data) =
+            fetch_inline_blob(cas_store, result.stderr_digest.as_ref(), &mut budget).await
+    {
+        result.stderr_raw = data;
+        changed = true;
+    }
+    for file in &mut result.output_files {
+        if hints.output_files.contains(&file.path)
+            && let Some(data) =
+                fetch_inline_blob(cas_store, file.digest.as_ref(), &mut budget).await
+        {
+            file.contents = data;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Applies the inlining hints to the final `Operation` of an `Execute`
+/// stream: the `ExecuteResponse` is decoded from the `Any`, inlined and
+/// re-encoded under the same type URL. Every other item passes through.
+async fn inline_execute_outputs(
+    item: Result<Operation, Status>,
+    hints: &InlineHints,
+    cas_store: &Store,
+) -> Result<Operation, Status> {
+    let mut operation = item?;
+    if !operation.done {
+        return Ok(operation);
+    }
+    let Some(LongRunningResult::Response(any)) = operation.result.as_mut() else {
+        return Ok(operation);
+    };
+    if any.type_url != ExecuteResponse::TYPE_URL {
+        return Ok(operation);
+    }
+    let mut response = match ExecuteResponse::decode(any.value.as_slice()) {
+        Ok(response) => response,
+        Err(err) => {
+            warn!(
+                ?err,
+                "Execute: could not decode the ExecuteResponse to inline outputs"
+            );
+            return Ok(operation);
+        }
+    };
+    let Some(action_result) = response.result.as_mut() else {
+        return Ok(operation);
+    };
+    if inline_action_result(action_result, hints, cas_store).await {
+        any.value = response.encode_to_vec();
+    }
+    Ok(operation)
 }
 
 enum ExecuteOutcome<S> {
@@ -613,6 +743,12 @@ impl ExecutionServer {
     ) -> Result<ExecuteOutcome<impl Stream<Item = Result<Operation, Status>> + Send + use<>>, Error>
     {
         let instance_name = request.instance_name;
+        let inline_hints = InlineHints::from_request(
+            request.inline_stdout,
+            request.inline_stderr,
+            request.inline_output_files,
+        )
+        .map(Arc::new);
 
         let instance_info = self.instance_infos.get(&instance_name).ok_or_else(|| {
             make_input_err!("'instance_name' not configured for '{instance_name}'")
@@ -723,7 +859,7 @@ impl ExecutionServer {
             .await
             .err_tip(|| "Failed to schedule task")?;
 
-        Ok(ExecuteOutcome::Stream(Self::to_execute_stream(
+        let stream = Self::to_execute_stream(
             &NativelinkOperationId::new(
                 instance_name,
                 action_listener
@@ -737,7 +873,20 @@ impl ExecutionServer {
             action_listener,
             instance_info.cas_store.clone(),
             instance_info.execute_stream_heartbeat,
-        )))
+        );
+        // Only a request that asks for inlining pays for decoding the final
+        // response; without hints the stream is returned as it is.
+        let Some(inline_hints) = inline_hints else {
+            return Ok(ExecuteOutcome::Stream(Either::Right(stream)));
+        };
+        let cas_store = instance_info.cas_store.clone();
+        Ok(ExecuteOutcome::Stream(Either::Left(stream.then(
+            move |item| {
+                let inline_hints = inline_hints.clone();
+                let cas_store = cas_store.clone();
+                async move { inline_execute_outputs(item, &inline_hints, &cas_store).await }
+            },
+        ))))
     }
 
     async fn inner_wait_execution(

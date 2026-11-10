@@ -25,13 +25,13 @@ use nativelink_error::{Code, Error, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::execution::v2::execution_server::Execution;
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    Action, Command, ExecuteRequest, RequestMetadata, ToolDetails, WaitExecutionRequest,
-    digest_function,
+    Action, ActionResult as ProtoActionResult, Command, ExecuteRequest, ExecuteResponse,
+    RequestMetadata, ToolDetails, WaitExecutionRequest, digest_function,
 };
 use nativelink_proto::google::longrunning::operations_server::Operations;
 use nativelink_proto::google::longrunning::{
     CancelOperationRequest, DeleteOperationRequest, GetOperationRequest, ListOperationsRequest,
-    WaitOperationRequest,
+    WaitOperationRequest, operation,
 };
 use nativelink_proto::google::rpc::{PreconditionFailure, Status as GrpcStatusProto};
 use nativelink_scheduler::known_platform_property_provider::KnownPlatformPropertyProvider;
@@ -41,7 +41,8 @@ use nativelink_store::ac_utils::serialize_and_upload_message;
 use nativelink_store::default_store_factory::store_factory;
 use nativelink_store::store_manager::StoreManager;
 use nativelink_util::action_messages::{
-    ActionInfo, ActionResult, ActionStage, ActionState, ActionUniqueQualifier, OperationId, TypeUrl,
+    ActionInfo, ActionResult, ActionStage, ActionState, ActionUniqueQualifier, FileInfo,
+    NameOrPath, OperationId, TypeUrl,
 };
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::DigestHasherFunc;
@@ -1014,5 +1015,212 @@ async fn queued_actions_are_stamped_from_the_injected_clock() -> Result<(), Erro
     );
     assert!(response.is_ok());
     assert_eq!(info.insert_timestamp, stamp);
+    Ok(())
+}
+
+/// Stores `data` in the CAS under a fake digest of the right size.
+async fn store_blob(
+    cas_store: &nativelink_util::store_trait::Store,
+    byte: u8,
+    data: &[u8],
+) -> Result<DigestInfo, Error> {
+    let digest = make_fake_digest(byte, data.len() as u64);
+    cas_store
+        .update_oneshot(digest, data.to_vec().into())
+        .await?;
+    Ok(digest)
+}
+
+/// Runs one `Execute` whose action completes with `result`, applying
+/// `with_hints` to the request, and returns the `ActionResult` of the final
+/// `ExecuteResponse` on the stream.
+async fn execute_with_inline_hints(
+    store_manager: &StoreManager,
+    with_hints: impl FnOnce(&mut ExecuteRequest),
+    result: ActionResult,
+) -> Result<ProtoActionResult, Box<dyn core::error::Error>> {
+    let cas_store = store_manager.get_store("main_cas").unwrap();
+    let command_digest = serialize_and_upload_message(
+        &Command::default(),
+        cas_store.as_pin(),
+        &mut DigestHasherFunc::Sha256.hasher(),
+    )
+    .await?;
+    let action_digest = upload_action(
+        &cas_store,
+        &Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(command_digest.into()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let (execution_server, mock_scheduler) = make_execution_server(store_manager)?;
+    let mut request = make_execute_request(action_digest);
+    with_hints(&mut request);
+    let state = MockActionStateResult {
+        states: vec![Arc::new(ActionState {
+            client_operation_id: OperationId::from("some_operation_id"),
+            stage: ActionStage::Completed(result),
+            action_digest,
+            last_transition_timestamp: SystemTime::UNIX_EPOCH,
+        })],
+    };
+    let (response, _) = tokio::join!(
+        execution_server.execute(Request::new(request)),
+        mock_scheduler.expect_add_action(Ok(Box::new(state))),
+    );
+    let mut updates = response?.into_inner();
+    let mut last = None;
+    while let Some(update) = updates.next().await {
+        last = Some(update?);
+    }
+    let last = last.expect("Execute stream ended without an operation");
+    assert!(last.done, "the last operation must be done");
+    let Some(operation::Result::Response(any)) = last.result else {
+        panic!("the final operation must carry an ExecuteResponse");
+    };
+    assert_eq!(any.type_url, ExecuteResponse::TYPE_URL);
+    let response = ExecuteResponse::decode(&*any.value)?;
+    Ok(response
+        .result
+        .expect("ExecuteResponse without an ActionResult"))
+}
+
+// REAPI ExecuteRequest.inline_stdout / inline_stderr: "A hint to the server to
+// request inlining stdout in the [ActionResult] message." / "A hint to the
+// server to request inlining stderr in the [ActionResult] message."
+#[nativelink_test]
+async fn execute_inlines_stdout_and_stderr_when_asked() -> Result<(), Box<dyn core::error::Error>> {
+    let store_manager = make_store_manager().await?;
+    let cas_store = store_manager.get_store("main_cas").unwrap();
+    let stdout_digest = store_blob(&cas_store, 0x01, b"to stdout").await?;
+    let stderr_digest = store_blob(&cas_store, 0x02, b"to stderr").await?;
+    let make_result = || ActionResult {
+        stdout_digest,
+        stderr_digest,
+        ..ActionResult::default()
+    };
+
+    let inlined = execute_with_inline_hints(
+        &store_manager,
+        |request| {
+            request.inline_stdout = true;
+            request.inline_stderr = true;
+        },
+        make_result(),
+    )
+    .await?;
+    assert_eq!(inlined.stdout_raw.as_ref(), b"to stdout");
+    assert_eq!(inlined.stderr_raw.as_ref(), b"to stderr");
+    assert_eq!(inlined.stdout_digest, Some(stdout_digest.into()));
+    assert_eq!(inlined.stderr_digest, Some(stderr_digest.into()));
+
+    let plain = execute_with_inline_hints(&store_manager, |_| {}, make_result()).await?;
+    assert!(plain.stdout_raw.is_empty());
+    assert!(plain.stderr_raw.is_empty());
+    Ok(())
+}
+
+// REAPI ExecuteRequest.inline_output_files: "A hint to the server to inline
+// the contents of the listed output files. Each path needs to exactly match
+// one file path in either `output_paths` or `output_files` (DEPRECATED since
+// v2.1) in the [Command] message."
+#[nativelink_test]
+async fn execute_inlines_only_the_listed_output_files() -> Result<(), Box<dyn core::error::Error>> {
+    let store_manager = make_store_manager().await?;
+    let cas_store = store_manager.get_store("main_cas").unwrap();
+    let wanted_digest = store_blob(&cas_store, 0x03, b"wanted").await?;
+    let other_digest = store_blob(&cas_store, 0x04, b"not wanted").await?;
+    let result = ActionResult {
+        output_files: vec![
+            FileInfo {
+                name_or_path: NameOrPath::Path("out/wanted".to_string()),
+                digest: wanted_digest,
+                is_executable: false,
+            },
+            FileInfo {
+                name_or_path: NameOrPath::Path("out/other".to_string()),
+                digest: other_digest,
+                is_executable: false,
+            },
+        ],
+        ..ActionResult::default()
+    };
+
+    let inlined = execute_with_inline_hints(
+        &store_manager,
+        |request| request.inline_output_files = vec!["out/wanted".to_string()],
+        result,
+    )
+    .await?;
+    let contents: HashMap<&str, &[u8]> = inlined
+        .output_files
+        .iter()
+        .map(|file| (file.path.as_str(), file.contents.as_ref()))
+        .collect();
+    assert_eq!(contents["out/wanted"], b"wanted");
+    assert!(contents["out/other"].is_empty());
+    assert!(inlined.stdout_raw.is_empty());
+    Ok(())
+}
+
+// REAPI ActionResult.stdout_raw: "The server MAY omit inlining, even if
+// requested, and MUST do so if inlining would cause the response to exceed
+// message size limits."
+#[nativelink_test]
+async fn execute_does_not_inline_a_blob_over_the_budget() -> Result<(), Box<dyn core::error::Error>>
+{
+    // One byte over the server's 1 MiB inline budget.
+    const OVER_BUDGET: usize = 1024 * 1024 + 1;
+    let store_manager = make_store_manager().await?;
+    let cas_store = store_manager.get_store("main_cas").unwrap();
+    let stdout_digest = store_blob(&cas_store, 0x05, &vec![b'x'; OVER_BUDGET]).await?;
+    let stderr_digest = store_blob(&cas_store, 0x06, b"small").await?;
+
+    let result = execute_with_inline_hints(
+        &store_manager,
+        |request| {
+            request.inline_stdout = true;
+            request.inline_stderr = true;
+        },
+        ActionResult {
+            stdout_digest,
+            stderr_digest,
+            ..ActionResult::default()
+        },
+    )
+    .await?;
+    assert!(result.stdout_raw.is_empty());
+    assert_eq!(result.stdout_digest, Some(stdout_digest.into()));
+    assert_eq!(result.stderr_raw.as_ref(), b"small");
+    Ok(())
+}
+
+// Inlining is a hint ("The server MAY omit inlining, even if requested"), so
+// a blob that cannot be read must not fail the `Execute` stream.
+#[nativelink_test]
+async fn execute_skips_a_missing_blob_without_failing() -> Result<(), Box<dyn core::error::Error>> {
+    let store_manager = make_store_manager().await?;
+    let cas_store = store_manager.get_store("main_cas").unwrap();
+    let missing_digest = make_fake_digest(0x07, 12);
+    let stderr_digest = store_blob(&cas_store, 0x08, b"still here").await?;
+
+    let result = execute_with_inline_hints(
+        &store_manager,
+        |request| {
+            request.inline_stdout = true;
+            request.inline_stderr = true;
+        },
+        ActionResult {
+            stdout_digest: missing_digest,
+            stderr_digest,
+            ..ActionResult::default()
+        },
+    )
+    .await?;
+    assert!(result.stdout_raw.is_empty());
+    assert_eq!(result.stdout_digest, Some(missing_digest.into()));
+    assert_eq!(result.stderr_raw.as_ref(), b"still here");
     Ok(())
 }
