@@ -589,6 +589,10 @@ impl TryFrom<SymlinkInfo> for OutputSymlink {
 pub struct DirectoryInfo {
     pub path: String,
     pub tree_digest: DigestInfo,
+    /// REv2 `OutputDirectory.is_topologically_sorted`. Defaults to false so
+    /// records stored before the field existed still decode.
+    #[serde(default)]
+    pub is_topologically_sorted: bool,
 }
 
 impl TryFrom<OutputDirectory> for DirectoryInfo {
@@ -601,6 +605,7 @@ impl TryFrom<OutputDirectory> for DirectoryInfo {
                 .tree_digest
                 .err_tip(|| "Expected tree_digest to exist in OutputDirectory")?
                 .try_into()?,
+            is_topologically_sorted: output_directory.is_topologically_sorted,
         })
     }
 }
@@ -610,7 +615,7 @@ impl From<DirectoryInfo> for OutputDirectory {
         Self {
             path: val.path,
             tree_digest: Some(val.tree_digest.into()),
-            is_topologically_sorted: false,
+            is_topologically_sorted: val.is_topologically_sorted,
             root_directory_digest: None,
         }
     }

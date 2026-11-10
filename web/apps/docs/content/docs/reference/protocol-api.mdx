@@ -164,9 +164,13 @@ writes its result to the Action Cache; that part is tracked in
 **`server_logs` is never populated.** The field exists; the worker does not
 fill it.
 
-**Output `Tree`s are deterministic.** `Tree.children` lists the directories
-below the root, ordered by name at each level, so equal output directories
-produce equal `tree_digest` values. The root appears only in `Tree.root`.
+**Output `Tree`s are deterministic and topologically sorted.**
+`Tree.children` lists the directories below the root in an order derived
+from their names at each level, so equal output directories produce equal
+`tree_digest` values. The root appears only in `Tree.root`. The worker sets
+`OutputDirectory.is_topologically_sorted`: each distinct directory is listed
+once, even when it occurs at several paths, and every directory comes after
+all of its parents.
 
 **Bad arguments return `INVALID_ARGUMENT`.** An unknown `instance_name`, or a
 request missing a digest it requires, is a client error, so every service

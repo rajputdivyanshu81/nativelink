@@ -2558,6 +2558,7 @@ mod tests {
                         "3edeaef5deb22b072c788adbbb15cef97d5b640a0133da260d3e0b1c0afd5ca6",
                         254
                     )?,
+                    is_topologically_sorted: true,
                 }],
                 output_file_symlinks: vec![SymlinkInfo {
                     name_or_path: NameOrPath::Path("rel_sym".to_string()),
@@ -2580,6 +2581,179 @@ mod tests {
                 error: None,
                 message: String::new(),
             }
+        );
+        Ok(())
+    }
+
+    // REv2 `OutputDirectory.is_topologically_sorted`: "If set, consumers MAY
+    // make the following assumptions about the directories contained in the
+    // the Tree [...]: All directories with the same binary representation are
+    // stored exactly once. All directories, apart from the root directory,
+    // are referenced by at least one parent directory. Directories are stored
+    // in topological order, with parents being stored before the child."
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn output_tree_is_topologically_sorted_and_deduplicated_test()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "foo_worker_id";
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let (_, slow_store, cas_store, ac_store) = setup_stores().await?;
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: Some(Store::new(ac_store.clone())),
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config: &UploadActionResultConfig {
+                    upload_ac_results_strategy: UploadCacheResultsStrategy::Never,
+                    ..Default::default()
+                },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                max_download_timeout: Duration::from_secs(DEFAULT_MAX_DOWNLOAD_TIMEOUT),
+                max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
+                max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
+                timeout_handled_externally: false,
+                active_input_leases: false,
+                #[cfg(target_os = "linux")]
+                readonly_input_mounts: Vec::new(),
+                directory_cache: None,
+                #[cfg(target_os = "linux")]
+                use_namespaces: use_namespaces(),
+            },
+            Callbacks {
+                now_fn: test_monotonic_clock,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?);
+        let action_result = {
+            // `out/a/x` and `out/b/x` are identical directories, so the Tree
+            // must hold one copy of `x`, after both `a` and `b`.
+            let command = Command {
+                arguments: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "mkdir -p out/a/x out/b/x out/b/y && \
+                         touch out/a/x/f out/b/x/f"
+                        .to_string(),
+                ],
+                output_paths: vec!["out".to_string()],
+                working_directory: ".".to_string(),
+                environment_variables: vec![EnvironmentVariable {
+                    name: "PATH".to_string(),
+                    value: env::var("PATH").unwrap(),
+                }],
+                ..Default::default()
+            };
+            let command_digest = serialize_and_upload_message(
+                &command,
+                cas_store.as_pin(),
+                &mut DigestHasherFunc::Sha256.hasher(),
+            )
+            .await?;
+            let input_root_digest = serialize_and_upload_message(
+                &Directory::default(),
+                cas_store.as_pin(),
+                &mut DigestHasherFunc::Sha256.hasher(),
+            )
+            .await?;
+            let action = Action {
+                command_digest: Some(command_digest.into()),
+                input_root_digest: Some(input_root_digest.into()),
+                ..Default::default()
+            };
+            let action_digest = serialize_and_upload_message(
+                &action,
+                cas_store.as_pin(),
+                &mut DigestHasherFunc::Sha256.hasher(),
+            )
+            .await?;
+
+            let execute_request = ExecuteRequest {
+                action_digest: Some(action_digest.into()),
+                digest_function: ProtoDigestFunction::Sha256.into(),
+                ..Default::default()
+            };
+            let operation_id = OperationId::default().to_string();
+
+            let running_action_impl = running_actions_manager
+                .create_and_add_action(
+                    WORKER_ID.to_string(),
+                    StartExecute {
+                        request_metadata: None,
+                        execute_request: Some(execute_request),
+                        operation_id,
+                        queued_timestamp: Some(make_system_time(1000).into()),
+                        platform: action.platform.clone(),
+                        worker_id: WORKER_ID.to_string(),
+                    },
+                )
+                .await?;
+
+            run_action(running_action_impl.clone()).await?
+        };
+        assert_eq!(action_result.output_folders.len(), 1);
+        let output_folder = &action_result.output_folders[0];
+        assert!(output_folder.is_topologically_sorted);
+
+        let tree =
+            get_and_decode_digest::<Tree>(slow_store.as_ref(), output_folder.tree_digest.into())
+                .await?;
+        let root = tree.root.expect("Tree must have a root Directory");
+        // Below `out` are `a`, `b`, `x` (twice on disk) and `y`: four
+        // distinct directories.
+        assert_eq!(tree.children.len(), 4, "children: {:?}", tree.children);
+
+        // The root first, then the children, in Tree order.
+        let ordered: Vec<&Directory> = core::iter::once(&root).chain(&tree.children).collect();
+        let encodings: Vec<Vec<u8>> = ordered
+            .iter()
+            .copied()
+            .map(Message::encode_to_vec)
+            .collect();
+        for (index, encoding) in encodings.iter().enumerate() {
+            assert!(
+                !encodings[..index].contains(encoding),
+                "directory {index} is a duplicate"
+            );
+        }
+        let digests: Vec<DigestInfo> = encodings
+            .iter()
+            .map(|encoding| compute_buf_digest(encoding, &mut DigestHasherFunc::Sha256.hasher()))
+            .collect();
+        let mut referenced = vec![false; ordered.len()];
+        for (parent_index, parent) in ordered.iter().enumerate() {
+            for node in &parent.directories {
+                let child_digest = DigestInfo::try_from(
+                    node.digest
+                        .clone()
+                        .expect("DirectoryNode must have a digest"),
+                )?;
+                let child_index = digests
+                    .iter()
+                    .position(|digest| *digest == child_digest)
+                    .expect("every referenced directory must be in the Tree");
+                // A parent is listed before all of its children.
+                assert!(
+                    child_index > parent_index,
+                    "directory {child_index} is listed before its parent {parent_index}"
+                );
+                referenced[child_index] = true;
+            }
+        }
+        // Every directory except the root is referenced by another one.
+        assert!(
+            referenced[1..].iter().all(|is_referenced| *is_referenced),
+            "unreferenced directory in {referenced:?}"
         );
         Ok(())
     }
@@ -9647,6 +9821,7 @@ done
                         "c80ff014a65938993c8a40d2c9743b65c012c42677d6e50147d2608eb053193f",
                         83,
                     )?,
+                    is_topologically_sorted: true,
                 },],
                 output_file_symlinks: vec![],
                 output_directory_symlinks: vec![],

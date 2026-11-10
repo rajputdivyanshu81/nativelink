@@ -2619,15 +2619,36 @@ fn upload_directory<'a, P: AsRef<Path> + Debug + Send + Sync + Clone + 'a>(
 }
 
 /// Builds the `Tree` for an output directory from `upload_directory`'s
-/// result. That result lists every directory below the root and then the
+/// result. That result lists every directory below the root in post-order
+/// (subdirectories in name order, children before parents) and then the
 /// root itself, last; the root belongs in `Tree.root` only. REv2
 /// `Tree.children`: "the directories referred to by the root and,
 /// recursively, all its children".
+///
+/// The children are written so that `OutputDirectory.is_topologically_sorted`
+/// holds: each distinct directory once, parents before children. Keeping the
+/// first occurrence of each directory in the post-order gives the post-order
+/// of a depth-first walk that skips visited directories, because a repeated
+/// subtree was fully emitted at its first occurrence; reversing a post-order
+/// gives a topological order. (Keeping first occurrences of a pre-order is
+/// not topological: with `R = {a: X, b: P}` and `P = {c: X}` it gives
+/// `[X, P]`.) The input order is deterministic, so the Tree digest is too.
+///
+/// prost encodes `Tree` as field 1 (`root`, tag `0x0a`) followed by each
+/// `children` entry as field 2 (tag `0x12`) in order, which is the encoding
+/// REv2 requires of a topologically sorted Tree, so no hand encoding is needed.
 fn output_tree(root: Directory, mut children: VecDeque<Directory>) -> ProtoTree {
     children.pop_back();
+    // `Directory` is not `Hash`; equal encodings mean equal digests.
+    let mut seen = HashSet::with_capacity(children.len());
+    let mut unique: Vec<Directory> = children
+        .into_iter()
+        .filter(|directory| seen.insert(directory.encode_to_vec()))
+        .collect();
+    unique.reverse();
     ProtoTree {
         root: Some(root),
-        children: children.into(),
+        children: unique,
     }
 }
 
@@ -4536,6 +4557,7 @@ impl RunningActionImpl {
                                 Ok(DirectoryInfo {
                                     path: entry,
                                     tree_digest,
+                                    is_topologically_sorted: true,
                                 })
                             })
                             .await
@@ -4580,6 +4602,7 @@ impl RunningActionImpl {
                                                 Ok(DirectoryInfo {
                                                     path: entry,
                                                     tree_digest,
+                                                    is_topologically_sorted: true,
                                                 })
                                             })
                                             .await

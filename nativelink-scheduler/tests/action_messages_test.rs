@@ -17,11 +17,11 @@ use std::time::SystemTime;
 
 use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
-use nativelink_proto::build::bazel::remote::execution::v2::ExecuteResponse;
+use nativelink_proto::build::bazel::remote::execution::v2::{ExecuteResponse, OutputDirectory};
 use nativelink_proto::google::longrunning::{Operation, operation};
 use nativelink_proto::google::rpc::Status;
 use nativelink_util::action_messages::{
-    ActionResult, ActionStage, ActionState, ActionUniqueKey, ActionUniqueQualifier,
+    ActionResult, ActionStage, ActionState, ActionUniqueKey, ActionUniqueQualifier, DirectoryInfo,
     ExecutionMetadata, OperationId,
 };
 use nativelink_util::common::DigestInfo;
@@ -93,5 +93,28 @@ async fn execute_response_status_message_is_some_on_success_test() -> Result<(),
     // This was once discovered to be None, which is why this test exists.
     assert_eq!(execute_response.status, Some(Status::default()));
 
+    Ok(())
+}
+
+// REv2 `OutputDirectory.is_topologically_sorted`: "If set, consumers MAY make
+// the following assumptions about the directories contained in the the Tree".
+// The flag has to survive the round trip through `DirectoryInfo`, which is
+// what the worker reports and the scheduler stores, or the client never sees
+// it.
+#[nativelink_test]
+async fn output_directory_is_topologically_sorted_round_trip_test() -> Result<(), Error> {
+    for is_topologically_sorted in [true, false] {
+        let output_directory = OutputDirectory {
+            path: "out".to_string(),
+            tree_digest: Some(DigestInfo::new([4u8; 32], 100).into()),
+            is_topologically_sorted,
+        };
+        let directory_info = DirectoryInfo::try_from(output_directory.clone())?;
+        assert_eq!(
+            directory_info.is_topologically_sorted,
+            is_topologically_sorted
+        );
+        assert_eq!(OutputDirectory::from(directory_info), output_directory);
+    }
     Ok(())
 }
