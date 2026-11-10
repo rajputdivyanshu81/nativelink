@@ -5439,8 +5439,13 @@ impl UploadActionResults {
     ) -> Result<(), Error> {
         let should_upload_historical_results =
             Self::should_cache_result(self.upload_historical_results_strategy, action_result, true);
-        let should_upload_ac_results =
-            Self::should_cache_result(self.upload_ac_results_strategy, action_result, false);
+        // REv2 `ExecuteResponse.status`: "If the status code is other than
+        // `OK`, then the result MUST NOT be cached." An error here is that
+        // status, even when the process exited 0 (a timed-out action that
+        // handles SIGTERM and exits cleanly), so no strategy may put it in
+        // the Action Cache. The historical store is not the Action Cache.
+        let should_upload_ac_results = action_result.error.is_none()
+            && Self::should_cache_result(self.upload_ac_results_strategy, action_result, false);
         // Shortcut so we don't need to convert to proto if not needed.
         if !should_upload_ac_results && !should_upload_historical_results {
             return Ok(());
