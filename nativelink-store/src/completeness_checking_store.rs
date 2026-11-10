@@ -14,6 +14,7 @@
 
 use core::pin::Pin;
 use core::{iter, mem};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -22,7 +23,8 @@ use futures::{FutureExt, TryFutureExt, select, try_join};
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    ActionResult as ProtoActionResult, OutputDirectory as ProtoOutputDirectory, Tree as ProtoTree,
+    ActionResult as ProtoActionResult, Directory as ProtoDirectory,
+    OutputDirectory as ProtoOutputDirectory, Tree as ProtoTree,
 };
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
@@ -58,9 +60,44 @@ fn get_digests_and_output_dirs(
     Ok((digest_infos, action_result.output_directories))
 }
 
+/// Collects the digests a `Tree` refers to: the digest of every file in it
+/// and, when the output directory also names a separately stored hierarchy
+/// (`root_directory_digest`), that root and every `DirectoryNode`'s digest,
+/// since those name the separately stored `Directory` blobs.
+fn tree_digest_infos(
+    tree: ProtoTree,
+    root_directory_digest: Option<DigestInfo>,
+) -> Result<Vec<DigestInfo>, Error> {
+    let mut digest_infos: Vec<DigestInfo> = root_directory_digest.into_iter().collect();
+    for dir in tree.children.into_iter().chain(tree.root) {
+        let nodes = if root_directory_digest.is_some() {
+            dir.directories
+        } else {
+            Vec::new()
+        };
+        for digest in dir
+            .files
+            .into_iter()
+            .filter_map(|f| f.digest)
+            .chain(nodes.into_iter().filter_map(|d| d.digest))
+        {
+            digest_infos.push(
+                DigestInfo::try_from(digest)
+                    .err_tip(|| "Expected digest to exist and be convertible")?,
+            );
+        }
+    }
+    Ok(digest_infos)
+}
+
 /// Given a list of output directories recursively get all digests
 /// that need to be checked and pass them into `handle_digest_infos_fn`
 /// as they are found.
+///
+/// An output directory with a `tree_digest` is checked through its `Tree`.
+/// One with only a `root_directory_digest` (REv2 `DIRECTORY_ONLY`) is
+/// walked by fetching each `Directory` from the CAS; a `Directory` that
+/// cannot be fetched makes the entry incomplete (`NotFound`).
 #[expect(clippy::future_not_send)] // TODO(jhpratt) remove this
 async fn check_output_directories<'a>(
     cas_store: &Store,
@@ -69,31 +106,52 @@ async fn check_output_directories<'a>(
 ) -> Result<(), Error> {
     let mut futures = FuturesUnordered::new();
 
-    let tree_digests = output_directories
-        .into_iter()
-        .filter_map(|output_dir| output_dir.tree_digest.map(DigestInfo::try_from));
-    for maybe_tree_digest in tree_digests {
-        let tree_digest = maybe_tree_digest
+    for output_dir in output_directories {
+        let tree_digest = output_dir
+            .tree_digest
+            .map(DigestInfo::try_from)
+            .transpose()
             .err_tip(|| "Could not decode tree digest CompletenessCheckingStore::has")?;
+        let root_directory_digest = output_dir
+            .root_directory_digest
+            .map(DigestInfo::try_from)
+            .transpose()
+            .err_tip(|| "Could not decode root directory digest CompletenessCheckingStore::has")?;
+        if tree_digest.is_none() && root_directory_digest.is_none() {
+            continue;
+        }
         futures.push(async move {
-            let tree = get_and_decode_digest::<ProtoTree>(cas_store, tree_digest.into()).await?;
-            // TODO(palfrey) When `try_collect()` is stable we can use it instead.
-            // https://github.com/rust-lang/rust/issues/94047
-            let mut digest_iter = tree.children.into_iter().chain(tree.root).flat_map(|dir| {
-                dir.files
-                    .into_iter()
-                    .filter_map(|f| f.digest.map(DigestInfo::try_from))
-            });
-
-            let mut digest_infos = Vec::with_capacity(digest_iter.size_hint().1.unwrap_or(0));
-            digest_iter
-                .try_for_each(|maybe_digest| {
-                    digest_infos.push(maybe_digest?.into());
-                    Result::<_, Error>::Ok(())
-                })
-                .err_tip(|| "Expected digest to exist and be convertible")?;
-            handle_digest_infos_fn(digest_infos);
-            Ok(())
+            let digest_infos = if let Some(tree_digest) = tree_digest {
+                let tree =
+                    get_and_decode_digest::<ProtoTree>(cas_store, tree_digest.into()).await?;
+                tree_digest_infos(tree, root_directory_digest)?
+            } else {
+                let mut digest_infos = Vec::new();
+                let mut seen = HashSet::new();
+                let mut pending: Vec<DigestInfo> = root_directory_digest.into_iter().collect();
+                while let Some(dir_digest) = pending.pop() {
+                    if !seen.insert(dir_digest) {
+                        continue;
+                    }
+                    let dir = get_and_decode_digest::<ProtoDirectory>(cas_store, dir_digest.into())
+                        .await?;
+                    for file_digest in dir.files.into_iter().filter_map(|f| f.digest) {
+                        digest_infos.push(
+                            DigestInfo::try_from(file_digest)
+                                .err_tip(|| "Expected digest to exist and be convertible")?,
+                        );
+                    }
+                    for dir_node_digest in dir.directories.into_iter().filter_map(|d| d.digest) {
+                        pending.push(
+                            DigestInfo::try_from(dir_node_digest)
+                                .err_tip(|| "Expected digest to exist and be convertible")?,
+                        );
+                    }
+                }
+                digest_infos
+            };
+            handle_digest_infos_fn(digest_infos.into_iter().map(Into::into).collect());
+            Result::<(), Error>::Ok(())
         });
     }
 
