@@ -17,7 +17,9 @@ use std::time::SystemTime;
 
 use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
-use nativelink_proto::build::bazel::remote::execution::v2::{ExecuteResponse, OutputDirectory};
+use nativelink_proto::build::bazel::remote::execution::v2::{
+    ExecuteOperationMetadata, ExecuteResponse, OutputDirectory, digest_function,
+};
 use nativelink_proto::google::longrunning::{Operation, operation};
 use nativelink_proto::google::rpc::Status;
 use nativelink_util::action_messages::{
@@ -27,6 +29,7 @@ use nativelink_util::action_messages::{
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::DigestHasherFunc;
 use pretty_assertions::assert_eq;
+use prost::Message;
 
 #[nativelink_test]
 async fn action_state_any_url_test() -> Result<(), Error> {
@@ -46,7 +49,7 @@ async fn action_state_any_url_test() -> Result<(), Error> {
         action_digest,
         last_transition_timestamp: SystemTime::now(),
     };
-    let operation: Operation = action_state.as_operation(client_id);
+    let operation: Operation = action_state.as_operation(client_id, None);
 
     match &operation.result {
         Some(operation::Result::Response(any)) => assert_eq!(
@@ -108,6 +111,7 @@ async fn output_directory_is_topologically_sorted_round_trip_test() -> Result<()
             path: "out".to_string(),
             tree_digest: Some(DigestInfo::new([4u8; 32], 100).into()),
             is_topologically_sorted,
+            root_directory_digest: None,
         };
         let directory_info = DirectoryInfo::try_from(output_directory.clone())?;
         assert_eq!(
@@ -115,6 +119,43 @@ async fn output_directory_is_topologically_sorted_round_trip_test() -> Result<()
             is_topologically_sorted
         );
         assert_eq!(OutputDirectory::from(directory_info), output_directory);
+    }
+    Ok(())
+}
+
+// REAPI `ExecuteOperationMetadata.digest_function`: "The digest function that
+// was used to compute the action digest. If the digest function used is one
+// of BLAKE3, MD5, MURMUR3, SHA1, SHA256, SHA256TREE, SHA384, SHA512, or VSO,
+// the server MAY leave this field unset."
+#[nativelink_test]
+async fn as_operation_sets_metadata_digest_function_test() -> Result<(), Error> {
+    let action_state = ActionState {
+        client_operation_id: OperationId::default(),
+        stage: ActionStage::Queued,
+        action_digest: DigestInfo::new([1u8; 32], 5),
+        last_transition_timestamp: SystemTime::now(),
+    };
+    for (digest_function, expected) in [
+        (
+            Some(DigestHasherFunc::Blake3),
+            i32::from(digest_function::Value::Blake3),
+        ),
+        (
+            Some(DigestHasherFunc::Sha256),
+            i32::from(digest_function::Value::Sha256),
+        ),
+        (None, i32::from(digest_function::Value::Unknown)),
+    ] {
+        let operation = action_state.as_operation(OperationId::default(), digest_function);
+        let metadata = ExecuteOperationMetadata::decode(
+            operation
+                .metadata
+                .expect("as_operation always sets metadata")
+                .value
+                .as_slice(),
+        )
+        .expect("metadata decodes as ExecuteOperationMetadata");
+        assert_eq!(metadata.digest_function, expected);
     }
     Ok(())
 }

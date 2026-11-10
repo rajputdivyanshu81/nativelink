@@ -160,7 +160,7 @@ async fn test_remote_exec_input_root_path_resolution_and_digest_qualifier() -> R
         last_transition_timestamp: SystemTime::now(),
     };
 
-    let operation: Operation = action_state.as_operation(client_id);
+    let operation: Operation = action_state.as_operation(client_id, None);
     match &operation.result {
         Some(operation::Result::Response(any)) => {
             assert_eq!(
