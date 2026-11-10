@@ -1298,7 +1298,14 @@ impl ActionState {
         })
     }
 
-    pub fn as_operation(&self, client_operation_id: OperationId) -> Operation {
+    /// Converts this state into the client's `Operation`. `digest_function`
+    /// is the function used to compute the action digest; `None` leaves
+    /// `ExecuteOperationMetadata.digest_function` unset.
+    pub fn as_operation(
+        &self,
+        client_operation_id: OperationId,
+        digest_function: Option<DigestHasherFunc>,
+    ) -> Operation {
         let stage = Into::<execution_stage::Value>::into(&self.stage) as i32;
         let name = client_operation_id.into_string();
 
@@ -1317,10 +1324,10 @@ impl ActionState {
             stdout_stream_name: String::default(),
             stderr_stream_name: String::default(),
             partial_execution_metadata: None,
-            // Left unset, which REAPI allows for the digest functions we
-            // support: the client infers it from the action digest's length
-            // and the capabilities.
-            digest_function: 0,
+            // SHA256 and BLAKE3 hashes have the same length, so a client
+            // cannot infer the function from the action digest. Unset (0)
+            // only when the caller does not know it, which REAPI permits.
+            digest_function: digest_function.map_or(0, |func| func.proto_digest_func() as i32),
         };
 
         Operation {

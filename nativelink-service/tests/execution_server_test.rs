@@ -18,20 +18,20 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
-use futures::{StreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 use nativelink_config::cas_server::{ExecutionConfig, WithInstanceName};
 use nativelink_config::stores::{MemorySpec, StoreSpec};
 use nativelink_error::{Code, Error, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::execution::v2::execution_server::Execution;
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    Action, Command, ExecuteRequest, RequestMetadata, ToolDetails, WaitExecutionRequest,
-    digest_function,
+    Action, Command, ExecuteOperationMetadata, ExecuteRequest, RequestMetadata, ToolDetails,
+    WaitExecutionRequest, digest_function,
 };
 use nativelink_proto::google::longrunning::operations_server::Operations;
 use nativelink_proto::google::longrunning::{
     CancelOperationRequest, DeleteOperationRequest, GetOperationRequest, ListOperationsRequest,
-    WaitOperationRequest,
+    Operation, WaitOperationRequest,
 };
 use nativelink_proto::google::rpc::{PreconditionFailure, Status as GrpcStatusProto};
 use nativelink_scheduler::known_platform_property_provider::KnownPlatformPropertyProvider;
@@ -41,7 +41,8 @@ use nativelink_store::ac_utils::serialize_and_upload_message;
 use nativelink_store::default_store_factory::store_factory;
 use nativelink_store::store_manager::StoreManager;
 use nativelink_util::action_messages::{
-    ActionInfo, ActionResult, ActionStage, ActionState, ActionUniqueQualifier, OperationId, TypeUrl,
+    ActionInfo, ActionResult, ActionStage, ActionState, ActionUniqueKey, ActionUniqueQualifier,
+    OperationId, TypeUrl,
 };
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::DigestHasherFunc;
@@ -1011,5 +1012,173 @@ async fn queued_actions_are_stamped_from_the_injected_clock() -> Result<(), Erro
     );
     assert!(response.is_ok());
     assert_eq!(info.insert_timestamp, stamp);
+    Ok(())
+}
+
+/// The `digest_function` of every `ExecuteOperationMetadata` in a stream,
+/// read until the stream ends.
+async fn metadata_digest_functions(
+    mut updates: impl Stream<Item = Result<Operation, tonic::Status>> + Unpin,
+) -> Result<Vec<i32>, Box<dyn core::error::Error>> {
+    let mut digest_functions = Vec::new();
+    while let Some(update) = updates.next().await {
+        let metadata = update?
+            .metadata
+            .expect("every Operation carries ExecuteOperationMetadata");
+        digest_functions
+            .push(ExecuteOperationMetadata::decode(metadata.value.as_slice())?.digest_function);
+    }
+    Ok(digest_functions)
+}
+
+/// Runs `Execute` for a stored Action with the request's `digest_function`
+/// through a Queued and a Completed update, and returns the metadata's
+/// `digest_function` of every streamed `Operation`.
+async fn execute_metadata_digest_functions(
+    request_digest_function: i32,
+) -> Result<Vec<i32>, Box<dyn core::error::Error>> {
+    let store_manager = make_store_manager().await?;
+    let (execution_server, mock_scheduler) = make_execution_server(&store_manager)?;
+    let cas_store = store_manager.get_store("main_cas").unwrap();
+    let command_digest = serialize_and_upload_message(
+        &Command::default(),
+        cas_store.as_pin(),
+        &mut DigestHasherFunc::Sha256.hasher(),
+    )
+    .await?;
+    let action_digest = upload_action(
+        &cas_store,
+        &Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(command_digest.into()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let state = |stage| {
+        Arc::new(ActionState {
+            client_operation_id: OperationId::from("digest_function_operation_id"),
+            stage,
+            action_digest,
+            last_transition_timestamp: SystemTime::UNIX_EPOCH,
+        })
+    };
+    let listener = MockActionStateResult {
+        states: vec![
+            state(ActionStage::Queued),
+            state(ActionStage::Completed(ActionResult::default())),
+        ],
+    };
+    let (response, _) = tokio::join!(
+        execution_server.execute(Request::new(ExecuteRequest {
+            digest_function: request_digest_function,
+            ..make_execute_request(action_digest)
+        })),
+        mock_scheduler.expect_add_action(Ok(Box::new(listener))),
+    );
+    metadata_digest_functions(response?.into_inner()).await
+}
+
+// REAPI `ExecuteOperationMetadata.digest_function`: "The digest function that
+// was used to compute the action digest." SHA256 and BLAKE3 hashes are both
+// 32 bytes, so a client cannot infer which one from the digest's length.
+#[nativelink_test]
+async fn execute_metadata_reports_requested_digest_function()
+-> Result<(), Box<dyn core::error::Error>> {
+    let blake3 = i32::from(digest_function::Value::Blake3);
+    let digest_functions = execute_metadata_digest_functions(blake3).await?;
+    assert_eq!(digest_functions, vec![blake3, blake3]);
+    Ok(())
+}
+
+// REAPI `ExecuteOperationMetadata.digest_function`: "The digest function that
+// was used to compute the action digest." With the request's field unset the
+// server uses its default, SHA256, and reports that.
+#[nativelink_test]
+async fn execute_metadata_reports_resolved_default_digest_function()
+-> Result<(), Box<dyn core::error::Error>> {
+    let digest_functions =
+        execute_metadata_digest_functions(i32::from(digest_function::Value::Unknown)).await?;
+    let sha256 = i32::from(digest_function::Value::Sha256);
+    assert_eq!(digest_functions, vec![sha256, sha256]);
+    Ok(())
+}
+
+/// A listener that reports its `ActionInfo`, as the simple scheduler's does.
+struct ActionInfoStateResult {
+    states: Vec<Arc<ActionState>>,
+    action_info: Arc<ActionInfo>,
+}
+
+#[async_trait]
+impl ActionStateResult for ActionInfoStateResult {
+    async fn as_state(&self) -> Result<(Arc<ActionState>, Option<OriginMetadata>), Error> {
+        Ok((self.states.first().unwrap().clone(), None))
+    }
+
+    async fn changed(&mut self) -> Result<(Arc<ActionState>, Option<OriginMetadata>), Error> {
+        if self.states.is_empty() {
+            return Err(make_err!(Code::Internal, "No more states"));
+        }
+        Ok((self.states.remove(0), None))
+    }
+
+    async fn as_action_info(&self) -> Result<(Arc<ActionInfo>, Option<OriginMetadata>), Error> {
+        Ok((self.action_info.clone(), None))
+    }
+}
+
+// REAPI `ExecuteOperationMetadata.digest_function`: "The digest function that
+// was used to compute the action digest. If the digest function used is one of
+// BLAKE3, MD5, MURMUR3, SHA1, SHA256, SHA256TREE, SHA384, SHA512, or VSO, the
+// server MAY leave this field unset." `WaitExecution` reports it when the
+// scheduler's listener gives the `ActionInfo`, and leaves it unset otherwise.
+#[nativelink_test]
+async fn wait_execution_metadata_reports_digest_function() -> Result<(), Box<dyn core::error::Error>>
+{
+    let action_digest = make_fake_digest(0xaa, 16);
+    let completed = Arc::new(ActionState {
+        client_operation_id: OperationId::from("some_operation_id"),
+        stage: ActionStage::Completed(ActionResult::default()),
+        action_digest,
+        last_transition_timestamp: SystemTime::UNIX_EPOCH,
+    });
+    let with_info: Box<dyn ActionStateResult> = Box::new(ActionInfoStateResult {
+        states: vec![completed.clone()],
+        action_info: Arc::new(ActionInfo {
+            command_digest: make_fake_digest(0xbb, 8),
+            input_root_digest: make_fake_digest(0xcc, 8),
+            timeout: core::time::Duration::MAX,
+            platform_properties: HashMap::new(),
+            priority: 0,
+            load_timestamp: SystemTime::UNIX_EPOCH,
+            insert_timestamp: SystemTime::UNIX_EPOCH,
+            unique_qualifier: ActionUniqueQualifier::Cacheable(ActionUniqueKey {
+                execution_scope: None,
+                instance_name: INSTANCE_NAME.to_string(),
+                digest_function: DigestHasherFunc::Blake3,
+                digest: action_digest,
+            }),
+        }),
+    });
+    let without_info: Box<dyn ActionStateResult> = Box::new(MockActionStateResult {
+        states: vec![completed],
+    });
+    for (listener, expected) in [
+        (with_info, i32::from(digest_function::Value::Blake3)),
+        (without_info, i32::from(digest_function::Value::Unknown)),
+    ] {
+        let store_manager = make_store_manager().await?;
+        let (execution_server, mock_scheduler) = make_execution_server(&store_manager)?;
+        let stream: ActionStateResultStream = Box::pin(stream::once(async move { listener }));
+        let (response, _) = tokio::join!(
+            execution_server.wait_execution(Request::new(WaitExecutionRequest {
+                name: format!("{INSTANCE_NAME}/some_operation_id"),
+            })),
+            mock_scheduler.expect_filter_operations(Ok(stream)),
+        );
+        let digest_functions = metadata_digest_functions(response?.into_inner()).await?;
+        assert_eq!(digest_functions, vec![expected]);
+    }
     Ok(())
 }

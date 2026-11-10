@@ -437,17 +437,19 @@ impl ExecutionServer {
 
     /// Converts one action state into the client's `Operation`, with the
     /// side effects every sent update carries. The bool says whether the
-    /// operation is finished.
+    /// operation is finished. `digest_function` fills the metadata's
+    /// `digest_function`; `None` leaves it unset.
     async fn operation_from_update(
         action_update: Arc<ActionState>,
         client_operation_id: &OperationId,
+        digest_function: Option<DigestHasherFunc>,
         cas_store: &Store,
     ) -> (Operation, bool) {
         debug!(?action_update, "Execute Resp Stream");
         forget_missing_input(cas_store, &action_update.stage).await;
         let finished = action_update.stage.is_finished();
         (
-            action_update.as_operation(client_operation_id.clone()),
+            action_update.as_operation(client_operation_id.clone(), digest_function),
             finished,
         )
     }
@@ -457,13 +459,18 @@ impl ExecutionServer {
     async fn next_operation(
         action_listener: &mut Box<dyn ActionStateResult>,
         client_operation_id: &OperationId,
+        digest_function: Option<DigestHasherFunc>,
         cas_store: &Store,
     ) -> (Result<Operation, Status>, bool) {
         match action_listener.changed().await {
             Ok((action_update, _maybe_origin_metadata)) => {
-                let (operation, finished) =
-                    Self::operation_from_update(action_update, client_operation_id, cas_store)
-                        .await;
+                let (operation, finished) = Self::operation_from_update(
+                    action_update,
+                    client_operation_id,
+                    digest_function,
+                    cas_store,
+                )
+                .await;
                 (Ok(operation), finished)
             }
             Err(err) => {
@@ -476,6 +483,7 @@ impl ExecutionServer {
     fn to_execute_stream(
         nl_client_operation_id: &NativelinkOperationId,
         action_listener: Box<dyn ActionStateResult>,
+        digest_function: Option<DigestHasherFunc>,
         cas_store: Store,
         heartbeat_interval: Option<Duration>,
     ) -> impl Stream<Item = Result<Operation, Status>> + Send + use<> {
@@ -511,6 +519,7 @@ impl ExecutionServer {
                         let (operation, finished) = Self::operation_from_update(
                             state,
                             &task_client_operation_id,
+                            digest_function,
                             &cas_store,
                         )
                         .await;
@@ -527,6 +536,7 @@ impl ExecutionServer {
                     let (item, finished) = Self::next_operation(
                         &mut action_listener,
                         &task_client_operation_id,
+                        digest_function,
                         &cas_store,
                     )
                     .await;
@@ -592,6 +602,7 @@ impl ExecutionServer {
                         let (item, finished) = Self::next_operation(
                             &mut action_listener,
                             &client_operation_id,
+                            digest_function,
                             &cas_store,
                         )
                         .await;
@@ -717,6 +728,8 @@ impl ExecutionServer {
                     .err_tip(|| "Could not convert digest function in inner_execute()")?,
             )
             .await?;
+        // The resolved function: the request's, or the instance default.
+        let digest_function = action_info.unique_qualifier.digest_function();
 
         let action_listener = instance_info
             .scheduler
@@ -736,6 +749,7 @@ impl ExecutionServer {
                     .clone(),
             ),
             action_listener,
+            Some(digest_function),
             instance_info.cas_store.clone(),
             instance_info.execute_stream_heartbeat,
         )))
@@ -773,9 +787,17 @@ impl ExecutionServer {
         else {
             return Err(Status::not_found("Failed to find existing task"));
         };
+        // Schedulers that cannot report the `ActionInfo` (Unimplemented) leave
+        // the metadata's digest function unset, which REAPI permits.
+        let digest_function = rx
+            .as_action_info()
+            .await
+            .ok()
+            .map(|(action_info, _)| action_info.unique_qualifier.digest_function());
         Ok(Self::to_execute_stream(
             &nl_operation_id,
             rx,
+            digest_function,
             instance_info.cas_store.clone(),
             instance_info.execute_stream_heartbeat,
         ))
