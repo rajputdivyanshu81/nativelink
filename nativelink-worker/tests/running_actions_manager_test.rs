@@ -2558,6 +2558,7 @@ mod tests {
                         "3edeaef5deb22b072c788adbbb15cef97d5b640a0133da260d3e0b1c0afd5ca6",
                         254
                     )?,
+                    root_directory_digest: None,
                 }],
                 output_file_symlinks: vec![SymlinkInfo {
                     name_or_path: NameOrPath::Path("rel_sym".to_string()),
@@ -2580,6 +2581,174 @@ mod tests {
                 error: None,
                 message: String::new(),
             }
+        );
+        Ok(())
+    }
+
+    // REv2 `Command.output_directory_format`: `DIRECTORY_ONLY` and
+    // `TREE_AND_DIRECTORY` ask for "a hierarchy of separately stored Directory
+    // objects, using the `root_directory_digest` field"; a worker "MAY store
+    // output directories in formats that are a superset of what was requested
+    // (e.g., interpreting DIRECTORY_ONLY as TREE_AND_DIRECTORY)", and given a
+    // value it does not support "SHOULD interpret this field as TREE_ONLY".
+    // `OutputDirectory.root_directory_digest`: "If both `tree_digest` and
+    // `root_directory_digest` are set, this field MUST match the digest of the
+    // root directory contained in the Tree message."
+    #[cfg(not(target_family = "windows"))]
+    #[nativelink_test]
+    async fn upload_dir_honours_output_directory_format() -> Result<(), Box<dyn core::error::Error>>
+    {
+        use nativelink_proto::build::bazel::remote::execution::v2::command::OutputDirectoryFormat;
+
+        const WORKER_ID: &str = "foo_worker_id";
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let mut tree_digests = Vec::new();
+        for (output_directory_format, stores_root_directory) in [
+            (OutputDirectoryFormat::TreeOnly as i32, false),
+            (OutputDirectoryFormat::DirectoryOnly as i32, true),
+            (OutputDirectoryFormat::TreeAndDirectory as i32, true),
+            // An unknown value is read as `TREE_ONLY`.
+            (99, false),
+        ] {
+            let (_, slow_store, cas_store, ac_store) = setup_stores().await?;
+            let root_action_directory = make_temp_path("root_action_directory");
+            fs::create_dir_all(&root_action_directory).await?;
+
+            let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+                RunningActionsManagerArgs {
+                    root_action_directory,
+                    execution_configuration: ExecutionConfiguration::default(),
+                    cas_store: cas_store.clone(),
+                    ac_store: Some(Store::new(ac_store.clone())),
+                    historical_store: Store::new(cas_store.clone()),
+                    upload_action_result_config: &UploadActionResultConfig {
+                        upload_ac_results_strategy: UploadCacheResultsStrategy::Never,
+                        ..Default::default()
+                    },
+                    max_action_timeout: Duration::MAX,
+                    max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                    max_download_timeout: Duration::from_secs(DEFAULT_MAX_DOWNLOAD_TIMEOUT),
+                    max_cleanup_wait: Duration::from_secs(DEFAULT_MAX_CLEANUP_WAIT),
+                    max_cleanup_backoff: Duration::from_millis(DEFAULT_MAX_CLEANUP_BACKOFF),
+                    timeout_handled_externally: false,
+                    active_input_leases: false,
+                    #[cfg(target_os = "linux")]
+                    readonly_input_mounts: Vec::new(),
+                    directory_cache: None,
+                    #[cfg(target_os = "linux")]
+                    use_namespaces: use_namespaces(),
+                },
+                Callbacks {
+                    now_fn: test_monotonic_clock,
+                    sleep_fn: |_duration| Box::pin(future::pending()),
+                },
+            )?);
+            let command = Command {
+                arguments: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "mkdir -p out/sub/deeper && echo foo > out/sub/file".to_string(),
+                ],
+                output_paths: vec!["out".to_string()],
+                working_directory: ".".to_string(),
+                environment_variables: vec![EnvironmentVariable {
+                    name: "PATH".to_string(),
+                    value: env::var("PATH").unwrap(),
+                }],
+                output_directory_format,
+                ..Default::default()
+            };
+            let command_digest = serialize_and_upload_message(
+                &command,
+                cas_store.as_pin(),
+                &mut DigestHasherFunc::Sha256.hasher(),
+            )
+            .await?;
+            let input_root_digest = serialize_and_upload_message(
+                &Directory::default(),
+                cas_store.as_pin(),
+                &mut DigestHasherFunc::Sha256.hasher(),
+            )
+            .await?;
+            let action = Action {
+                command_digest: Some(command_digest.into()),
+                input_root_digest: Some(input_root_digest.into()),
+                ..Default::default()
+            };
+            let action_digest = serialize_and_upload_message(
+                &action,
+                cas_store.as_pin(),
+                &mut DigestHasherFunc::Sha256.hasher(),
+            )
+            .await?;
+            let execute_request = ExecuteRequest {
+                action_digest: Some(action_digest.into()),
+                digest_function: ProtoDigestFunction::Sha256.into(),
+                ..Default::default()
+            };
+            let running_action_impl = running_actions_manager
+                .create_and_add_action(
+                    WORKER_ID.to_string(),
+                    StartExecute {
+                        request_metadata: None,
+                        execute_request: Some(execute_request),
+                        operation_id: OperationId::default().to_string(),
+                        queued_timestamp: Some(make_system_time(1000).into()),
+                        platform: action.platform.clone(),
+                        worker_id: WORKER_ID.to_string(),
+                    },
+                )
+                .await?;
+            let action_result = run_action(running_action_impl).await?;
+
+            assert_eq!(action_result.output_folders.len(), 1);
+            let output_folder = &action_result.output_folders[0];
+            let tree = get_and_decode_digest::<Tree>(
+                slow_store.as_ref(),
+                output_folder.tree_digest.into(),
+            )
+            .await?;
+            tree_digests.push(output_folder.tree_digest);
+            let root = tree.root.as_ref().expect("Tree must have a root");
+            let root_digest = compute_buf_digest(
+                &root.encode_to_vec(),
+                &mut DigestHasherFunc::Sha256.hasher(),
+            );
+            if stores_root_directory {
+                assert_eq!(
+                    output_folder.root_directory_digest,
+                    Some(root_digest),
+                    "root_directory_digest must be the digest of Tree.root, format {output_directory_format}",
+                );
+                // The whole hierarchy is stored as separate Directory blobs:
+                // the root and every directory below it.
+                assert_eq!(tree.children.len(), 2);
+                for directory in tree.children.iter().chain([root]) {
+                    let digest = compute_buf_digest(
+                        &directory.encode_to_vec(),
+                        &mut DigestHasherFunc::Sha256.hasher(),
+                    );
+                    assert!(
+                        slow_store.has(digest).await?.is_some(),
+                        "Directory {digest} must be in the CAS, format {output_directory_format}",
+                    );
+                }
+            } else {
+                assert_eq!(
+                    output_folder.root_directory_digest, None,
+                    "root_directory_digest must be unset, format {output_directory_format}",
+                );
+            }
+        }
+        // The Tree is stored whatever the format, and is the same Tree.
+        assert!(
+            tree_digests.iter().all(|digest| *digest == tree_digests[0]),
+            "tree_digest must not depend on output_directory_format: {tree_digests:?}",
         );
         Ok(())
     }
@@ -9647,6 +9816,7 @@ done
                         "c80ff014a65938993c8a40d2c9743b65c012c42677d6e50147d2608eb053193f",
                         83,
                     )?,
+                    root_directory_digest: None,
                 },],
                 output_file_symlinks: vec![],
                 output_directory_symlinks: vec![],

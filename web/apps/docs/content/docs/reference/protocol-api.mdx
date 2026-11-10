@@ -163,6 +163,17 @@ fill it.
 below the root, ordered by name at each level, so equal output directories
 produce equal `tree_digest` values. The root appears only in `Tree.root`.
 
+**`Command.output_directory_format` is honoured as a superset.** With
+`DIRECTORY_ONLY` or `TREE_AND_DIRECTORY`, the worker also stores the root
+`Directory` on its own, next to the subdirectories it already stores, and sets
+`root_directory_digest`, which equals the digest of `Tree.root`. It always
+stores the `Tree` and sets `tree_digest` as well, so `DIRECTORY_ONLY` is served
+as `TREE_AND_DIRECTORY`, which the REAPI permits. An unknown value is read as
+`TREE_ONLY`. The Action Cache's completeness check covers the separately
+stored directories: an entry with `root_directory_digest` is served only when
+that `Directory` and every `Directory` below it exist in the CAS. See
+<SourceLink file="nativelink-store/src/completeness_checking_store.rs" symbol="check_output_directories" />.
+
 **Bad arguments return `INVALID_ARGUMENT`.** An unknown `instance_name`, or a
 request missing a digest it requires, is a client error, so every service
 answers `INVALID_ARGUMENT` rather than `INTERNAL`. Clients such as Bazel retry

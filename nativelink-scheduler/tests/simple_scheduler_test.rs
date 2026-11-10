@@ -1651,6 +1651,7 @@ async fn update_action_sends_completed_result_to_client_test() -> Result<(), Err
         output_folders: vec![DirectoryInfo {
             path: "123".to_string(),
             tree_digest: DigestInfo::new([9u8; 32], 100),
+            root_directory_digest: None,
         }],
         output_file_symlinks: vec![SymlinkInfo {
             name_or_path: NameOrPath::Name("foo".to_string()),
@@ -1760,6 +1761,7 @@ async fn update_action_sends_completed_result_after_disconnect() -> Result<(), E
         output_folders: vec![DirectoryInfo {
             path: "123".to_string(),
             tree_digest: DigestInfo::new([9u8; 32], 100),
+            root_directory_digest: None,
         }],
         output_file_symlinks: vec![SymlinkInfo {
             name_or_path: NameOrPath::Name("foo".to_string()),

@@ -47,6 +47,7 @@ use nativelink_config::cas_server::{
 };
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_metric::MetricsComponent;
+use nativelink_proto::build::bazel::remote::execution::v2::command::OutputDirectoryFormat;
 use nativelink_proto::build::bazel::remote::execution::v2::{
     Action, ActionResult as ProtoActionResult, Command as ProtoCommand,
     Directory as ProtoDirectory, Directory, DirectoryNode, ExecuteResponse, FileNode, SymlinkNode,
@@ -2620,6 +2621,49 @@ fn output_tree(root: Directory, mut children: VecDeque<Directory>) -> ProtoTree 
     }
 }
 
+/// Stores an output directory in the CAS and describes it.
+///
+/// The `Tree` is always stored and `tree_digest` always set, whatever
+/// `Command.output_directory_format` asks for. REv2: a worker "MAY store
+/// output directories in formats that are a superset of what was requested
+/// (e.g., interpreting `DIRECTORY_ONLY` as `TREE_AND_DIRECTORY`)", and
+/// NativeLink's own consumers read `tree_digest`.
+///
+/// With `store_root_directory`, the root `Directory` is stored on its own as
+/// well. `upload_directory` already stored every `Directory` below it, so the
+/// hierarchy is complete. REv2 `OutputDirectory.root_directory_digest`: "If
+/// both `tree_digest` and `root_directory_digest` are set, this field MUST
+/// match the digest of the root directory contained in the Tree message."
+/// It does: this is the same `Directory` value that becomes `Tree.root`,
+/// encoded and hashed with the same digest function.
+async fn upload_output_directory(
+    path: String,
+    root: Directory,
+    children: VecDeque<Directory>,
+    cas_store: Pin<&FastSlowStore>,
+    hasher: DigestHasherFunc,
+    store_root_directory: bool,
+) -> Result<DirectoryInfo, Error> {
+    let root_directory_digest = if store_root_directory {
+        Some(
+            serialize_and_upload_message(&root, cas_store, &mut hasher.hasher())
+                .await
+                .err_tip(|| format!("While storing the root directory of {path}"))?,
+        )
+    } else {
+        None
+    };
+    let tree = output_tree(root, children);
+    let tree_digest = serialize_and_upload_message(&tree, cas_store, &mut hasher.hasher())
+        .await
+        .err_tip(|| format!("While processing {path}"))?;
+    Ok(DirectoryInfo {
+        path,
+        tree_digest,
+        root_directory_digest,
+    })
+}
+
 async fn process_side_channel_file(
     side_channel_file: Cow<'_, OsStr>,
     args: &[&OsStr],
@@ -4452,6 +4496,12 @@ impl RunningActionImpl {
             output_paths.append(&mut command_proto.output_files);
             output_paths.append(&mut command_proto.output_directories);
         }
+        // REv2 `Command.output_directory_format`: a worker given a value it
+        // does not support "SHOULD interpret this field as `TREE_ONLY`".
+        let store_root_directory = matches!(
+            OutputDirectoryFormat::try_from(command_proto.output_directory_format),
+            Ok(OutputDirectoryFormat::DirectoryOnly | OutputDirectoryFormat::TreeAndDirectory)
+        );
         let digest_uploaders = Arc::new(Mutex::new(HashMap::new()));
         let uploads = Arc::new(Semaphore::new(UPLOAD_CONCURRENCY));
         for entry in output_paths {
@@ -4513,19 +4563,15 @@ impl RunningActionImpl {
                                 digest_uploaders,
                                 uploads,
                             )
-                            .and_then(|(root_dir, children)| async move {
-                                let tree = output_tree(root_dir, children);
-                                let tree_digest = serialize_and_upload_message(
-                                    &tree,
+                            .and_then(|(root_dir, children)| {
+                                upload_output_directory(
+                                    entry,
+                                    root_dir,
+                                    children,
                                     cas_store.as_pin(),
-                                    &mut hasher.hasher(),
+                                    hasher,
+                                    store_root_directory,
                                 )
-                                .await
-                                .err_tip(|| format!("While processing {entry}"))?;
-                                Ok(DirectoryInfo {
-                                    path: entry,
-                                    tree_digest,
-                                })
                             })
                             .await
                             .err_tip(|| format!("Uploading directory {}", full_path.display()))?,
@@ -4557,19 +4603,15 @@ impl RunningActionImpl {
                                                 digest_uploaders,
                                                 uploads,
                                             )
-                                            .and_then(|(root_dir, children)| async move {
-                                                let tree = output_tree(root_dir, children);
-                                                let tree_digest = serialize_and_upload_message(
-                                                    &tree,
+                                            .and_then(|(root_dir, children)| {
+                                                upload_output_directory(
+                                                    entry,
+                                                    root_dir,
+                                                    children,
                                                     cas_store.as_pin(),
-                                                    &mut hasher.hasher(),
+                                                    hasher,
+                                                    store_root_directory,
                                                 )
-                                                .await
-                                                .err_tip(|| format!("While processing {entry}"))?;
-                                                Ok(DirectoryInfo {
-                                                    path: entry,
-                                                    tree_digest,
-                                                })
                                             })
                                             .await
                                             .err_tip(

@@ -15,13 +15,15 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use nativelink_error::Error;
+use nativelink_error::{Code, Error};
 use nativelink_macro::nativelink_test;
-use nativelink_proto::build::bazel::remote::execution::v2::ExecuteResponse;
+use nativelink_proto::build::bazel::remote::execution::v2::{
+    Digest, ExecuteResponse, OutputDirectory,
+};
 use nativelink_proto::google::longrunning::{Operation, operation};
 use nativelink_proto::google::rpc::Status;
 use nativelink_util::action_messages::{
-    ActionResult, ActionStage, ActionState, ActionUniqueKey, ActionUniqueQualifier,
+    ActionResult, ActionStage, ActionState, ActionUniqueKey, ActionUniqueQualifier, DirectoryInfo,
     ExecutionMetadata, OperationId,
 };
 use nativelink_util::common::DigestInfo;
@@ -92,6 +94,54 @@ async fn execute_response_status_message_is_some_on_success_test() -> Result<(),
 
     // This was once discovered to be None, which is why this test exists.
     assert_eq!(execute_response.status, Some(Status::default()));
+
+    Ok(())
+}
+
+// REv2 `OutputDirectory.root_directory_digest`: "The digest of the encoded
+// Directory proto containing the contents of the directory's root." It must
+// survive the round trip through `DirectoryInfo`, which is what the scheduler
+// stores and serves.
+#[nativelink_test]
+async fn directory_info_keeps_root_directory_digest_test() -> Result<(), Error> {
+    for root_directory_digest in [None, Some(DigestInfo::new([8u8; 32], 42))] {
+        let output_directory = OutputDirectory {
+            path: "out".to_string(),
+            tree_digest: Some(DigestInfo::new([7u8; 32], 99).into()),
+            is_topologically_sorted: false,
+            root_directory_digest: root_directory_digest.map(Into::into),
+        };
+        let directory_info = DirectoryInfo::try_from(output_directory.clone())?;
+        assert_eq!(directory_info.root_directory_digest, root_directory_digest);
+        assert_eq!(OutputDirectory::from(directory_info), output_directory);
+    }
+
+    // An invalid digest is an error, as for `tree_digest`.
+    let invalid = OutputDirectory {
+        path: "out".to_string(),
+        tree_digest: Some(DigestInfo::new([7u8; 32], 99).into()),
+        is_topologically_sorted: false,
+        root_directory_digest: Some(Digest {
+            hash: "not hex".to_string(),
+            size_bytes: 1,
+        }),
+    };
+    assert!(DirectoryInfo::try_from(invalid).is_err());
+
+    // A record stored before the field existed still decodes.
+    let mut stored = serde_json::to_value(DirectoryInfo {
+        path: "out".to_string(),
+        tree_digest: DigestInfo::new([7u8; 32], 99),
+        root_directory_digest: None,
+    })
+    .map_err(|e| Error::from_std_err(Code::Internal, &e))?;
+    stored
+        .as_object_mut()
+        .expect("DirectoryInfo serializes to an object")
+        .remove("root_directory_digest");
+    let decoded: DirectoryInfo =
+        serde_json::from_value(stored).map_err(|e| Error::from_std_err(Code::Internal, &e))?;
+    assert_eq!(decoded.root_directory_digest, None);
 
     Ok(())
 }

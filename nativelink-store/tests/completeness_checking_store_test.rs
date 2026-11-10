@@ -373,3 +373,185 @@ async fn backend_error_on_record_propagates_as_non_not_found() -> Result<(), Err
 
     Ok(())
 }
+
+/// Stores an output directory as a separately stored `Directory` hierarchy
+/// (a root holding `ROOT_FILE` and one child directory holding `CHILD_FILE`)
+/// and, when `with_tree`, also as a `Tree`. Returns the Action Cache store,
+/// the CAS, the action result digest, the root `Directory` digest and the
+/// child `Directory` digest.
+async fn setup_separately_stored_directories(
+    with_tree: bool,
+) -> Result<
+    (
+        Arc<CompletenessCheckingStore>,
+        Arc<MemoryStore>,
+        DigestInfo,
+        DigestInfo,
+        DigestInfo,
+    ),
+    Error,
+> {
+    let backend_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let cas_store = MemoryStore::new(&MemorySpec::default());
+    let ac_store =
+        CompletenessCheckingStore::new(backend_store.clone(), Store::new(cas_store.clone()));
+
+    cas_store.update_oneshot(ROOT_FILE, "".into()).await?;
+    cas_store.update_oneshot(CHILD_FILE, "".into()).await?;
+
+    let child = Directory {
+        files: vec![FileNode {
+            name: "child_file".to_string(),
+            digest: Some(CHILD_FILE.into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let child_digest = serialize_and_upload_message(
+        &child,
+        cas_store.as_pin(),
+        &mut DigestHasherFunc::Blake3.hasher(),
+    )
+    .await?;
+    let root = Directory {
+        files: vec![FileNode {
+            name: "root_file".to_string(),
+            digest: Some(ROOT_FILE.into()),
+            ..Default::default()
+        }],
+        directories: vec![DirectoryNode {
+            name: "child".to_string(),
+            digest: Some(child_digest.into()),
+        }],
+        ..Default::default()
+    };
+    let root_digest = serialize_and_upload_message(
+        &root,
+        cas_store.as_pin(),
+        &mut DigestHasherFunc::Blake3.hasher(),
+    )
+    .await?;
+
+    let tree_digest = if with_tree {
+        let tree = Tree {
+            root: Some(root),
+            children: vec![child],
+        };
+        Some(
+            serialize_and_upload_message(
+                &tree,
+                cas_store.as_pin(),
+                &mut DigestHasherFunc::Blake3.hasher(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    let action_result = ProtoActionResult {
+        output_directories: vec![OutputDirectory {
+            tree_digest: tree_digest.map(Into::into),
+            root_directory_digest: Some(root_digest.into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let action_result_digest = serialize_and_upload_message(
+        &action_result,
+        ac_store.as_pin(),
+        &mut DigestHasherFunc::Blake3.hasher(),
+    )
+    .await?;
+
+    Ok((
+        ac_store,
+        cas_store,
+        action_result_digest,
+        root_digest,
+        child_digest,
+    ))
+}
+
+// REv2 `ActionCache.GetActionResult`: "Implementations SHOULD ensure that any
+// blobs referenced from the ContentAddressableStorage are available at the
+// time of returning the ActionResult". With `root_directory_digest` set
+// (REv2: "The digest of the encoded Directory proto containing the
+// contents of the directory's root"), the separately stored `Directory` blobs are
+// referenced too.
+#[nativelink_test]
+async fn root_directory_digest_with_tree_is_checked() -> Result<(), Error> {
+    {
+        let (ac_store, _cas_store, action_result_digest, _, _) =
+            setup_separately_stored_directories(true).await?;
+        let res = ac_store.has_many(&[action_result_digest.into()]).await?;
+        assert!(
+            res[0].is_some(),
+            "Results should be some with every directory in CAS."
+        );
+    }
+
+    {
+        let (ac_store, cas_store, action_result_digest, root_digest, _) =
+            setup_separately_stored_directories(true).await?;
+        cas_store.remove_entry(root_digest.into()).await;
+        let res = ac_store.has_many(&[action_result_digest.into()]).await?;
+        assert!(
+            res[0].is_none(),
+            "Results should be none with the root directory missing."
+        );
+    }
+
+    {
+        let (ac_store, cas_store, action_result_digest, _, child_digest) =
+            setup_separately_stored_directories(true).await?;
+        cas_store.remove_entry(child_digest.into()).await;
+        let res = ac_store.has_many(&[action_result_digest.into()]).await?;
+        assert!(
+            res[0].is_none(),
+            "Results should be none with a child directory missing."
+        );
+    }
+
+    Ok(())
+}
+
+// REv2 `OutputDirectory.root_directory_digest` with no `tree_digest`
+// (`DIRECTORY_ONLY`): the hierarchy is walked through the CAS, so a missing
+// nested `Directory` makes the entry incomplete.
+#[nativelink_test]
+async fn root_directory_digest_only_is_walked() -> Result<(), Error> {
+    {
+        let (ac_store, _cas_store, action_result_digest, _, _) =
+            setup_separately_stored_directories(false).await?;
+        let res = ac_store.has_many(&[action_result_digest.into()]).await?;
+        assert!(
+            res[0].is_some(),
+            "Results should be some with every directory in CAS."
+        );
+    }
+
+    {
+        let (ac_store, cas_store, action_result_digest, _, child_digest) =
+            setup_separately_stored_directories(false).await?;
+        cas_store.remove_entry(child_digest.into()).await;
+        let res = ac_store.has_many(&[action_result_digest.into()]).await?;
+        assert!(
+            res[0].is_none(),
+            "Results should be none with a nested directory missing."
+        );
+    }
+
+    {
+        let (ac_store, cas_store, action_result_digest, _, _) =
+            setup_separately_stored_directories(false).await?;
+        cas_store.remove_entry(CHILD_FILE.into()).await;
+        let res = ac_store.has_many(&[action_result_digest.into()]).await?;
+        assert!(
+            res[0].is_none(),
+            "Results should be none with a nested file missing."
+        );
+    }
+
+    Ok(())
+}

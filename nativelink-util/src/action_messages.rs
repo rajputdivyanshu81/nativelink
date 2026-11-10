@@ -589,6 +589,11 @@ impl TryFrom<SymlinkInfo> for OutputSymlink {
 pub struct DirectoryInfo {
     pub path: String,
     pub tree_digest: DigestInfo,
+    /// The digest of the root `Directory`, stored in the CAS on its own
+    /// with every `Directory` below it (REv2 `OutputDirectory.root_directory_digest`).
+    /// `None` when only the `Tree` was stored.
+    #[serde(default)]
+    pub root_directory_digest: Option<DigestInfo>,
 }
 
 impl TryFrom<OutputDirectory> for DirectoryInfo {
@@ -601,6 +606,11 @@ impl TryFrom<OutputDirectory> for DirectoryInfo {
                 .tree_digest
                 .err_tip(|| "Expected tree_digest to exist in OutputDirectory")?
                 .try_into()?,
+            root_directory_digest: output_directory
+                .root_directory_digest
+                .map(DigestInfo::try_from)
+                .transpose()
+                .err_tip(|| "Invalid root_directory_digest in OutputDirectory")?,
         })
     }
 }
@@ -611,7 +621,7 @@ impl From<DirectoryInfo> for OutputDirectory {
             path: val.path,
             tree_digest: Some(val.tree_digest.into()),
             is_topologically_sorted: false,
-            root_directory_digest: None,
+            root_directory_digest: val.root_directory_digest.map(Into::into),
         }
     }
 }
