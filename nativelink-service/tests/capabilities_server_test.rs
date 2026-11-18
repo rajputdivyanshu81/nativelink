@@ -24,6 +24,7 @@ use nativelink_proto::build::bazel::remote::execution::v2::capabilities_server::
 use nativelink_proto::build::bazel::remote::execution::v2::{
     GetCapabilitiesRequest, ServerCapabilities, compressor, digest_function,
 };
+use nativelink_proto::build::bazel::semver::SemVer;
 use nativelink_scheduler::known_platform_property_provider::KnownPlatformPropertyProvider;
 use nativelink_scheduler::mock_scheduler::MockActionScheduler;
 use nativelink_service::capabilities_server::CapabilitiesServer;
@@ -98,6 +99,29 @@ async fn compression_only_instance_advertises_zstd_cache_capabilities()
         cache_capabilities.supported_batch_update_compressors,
         vec![compressor::Value::Zstd as i32]
     );
+    Ok(())
+}
+
+// REv2 `ServerCapabilities.high_api_version`: "Latest RE API version
+// supported." NativeLink implements the additions up to v2.11
+// (`ExecuteOperationMetadata.digest_function`), so it advertises 2.0 to 2.11.
+#[nativelink_test]
+async fn advertises_api_versions_2_0_to_2_11() -> Result<(), Box<dyn core::error::Error>> {
+    let configs = [capabilities_config(COMPRESSION_INSTANCE, true, false)];
+    let remote_cache_compression_instances =
+        RemoteCacheCompressionInstances::from_capabilities_configs(&configs);
+    let server = CapabilitiesServer::new(
+        &configs,
+        &HashMap::new(),
+        &remote_cache_compression_instances,
+        &[],
+    )
+    .await?;
+
+    let response = get_capabilities(&server, COMPRESSION_INSTANCE).await?;
+    let version = |v: Option<SemVer>| v.map(|v| (v.major, v.minor, v.patch));
+    assert_eq!(version(response.low_api_version), Some((2, 0, 0)));
+    assert_eq!(version(response.high_api_version), Some((2, 11, 0)));
     Ok(())
 }
 

@@ -192,7 +192,7 @@ impl Capabilities for CapabilitiesServer {
             }),
             high_api_version: Some(SemVer {
                 major: 2,
-                minor: 3,
+                minor: 11,
                 patch: 0,
                 prerelease: String::new(),
             }),
